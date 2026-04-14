@@ -28,9 +28,22 @@ def main():
 
     with sync_playwright() as p:
         headless = not os.environ.get("DISPLAY")
-        browser = p.chromium.launch(headless=headless, slow_mo=300)
-        context = browser.new_context()
+        browser = p.chromium.launch(
+            headless=headless,
+            slow_mo=300,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ],
+        )
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+            extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
+        )
         page = context.new_page()
+
+        page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
 
         print("Opening login page...")
         page.goto("https://startmotor.chainels.com/login")
