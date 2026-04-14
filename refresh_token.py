@@ -27,7 +27,8 @@ def main():
     password = env.get("CHAINELS_PASSWORD") or os.environ.get("CHAINELS_PASSWORD", "")
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False, slow_mo=300)
+        headless = not os.environ.get("DISPLAY")
+        browser = p.chromium.launch(headless=headless, slow_mo=300)
         context = browser.new_context()
         page = context.new_page()
 
