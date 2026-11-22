@@ -10,8 +10,14 @@ Drop this file next to digest.py and refresh_token.py, then run it from cron.
 
 Extra .env keys (on top of the CHAINELS_* ones digest.py already uses):
 
-    ANTHROPIC_API_KEY=sk-ant-...
-    CLAUDE_MODEL=claude-haiku-5-5          # optional
+    # Which Claude to use for "is this important?"
+    LLM_BACKEND=claude-cli                 # default: Claude Code CLI on your Claude subscription
+                                           #   one-time setup: install Claude Code, run `claude` once and log in
+    # LLM_BACKEND=api                      # or: Anthropic API, billed per use, needs ANTHROPIC_API_KEY
+    # ANTHROPIC_API_KEY=sk-ant-...
+    CLAUDE_MODEL=haiku                     # optional; alias (haiku/sonnet/opus) for the CLI,
+                                           #   for the API use a full ID, e.g. claude-haiku-5-5
+    CLAUDE_BIN=/home/you/.local/bin/claude # optional; cron's PATH is minimal, set this if `claude` isn't found
     NOTIFY_PROFILE=I live in unit X on floor Y, I have a bike in the storage, no car.   # optional, sharpens filtering
 
     # Email (Gmail: create an App Password, normal password won't work)
@@ -29,6 +35,7 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 import smtplib
 import subprocess
 import sys
@@ -120,25 +127,71 @@ Items:
 {items}"""
 
 
-def classify(items):
-    """items: list of dicts with id/kind/... ; returns list of verdict dicts."""
+SYSTEM = ("You are a filter in an unattended notification pipeline, not a coding assistant. "
+          "You have no tools. Reply with the requested JSON only, no prose, no code fences.")
+
+
+def build_prompt(items):
     profile = os.environ.get("NOTIFY_PROFILE", "").strip()
     profile = f"About this resident: {profile}\n" if profile else ""
-    body = {
-        "model": os.environ.get("CLAUDE_MODEL", "claude-haiku-5-5"),
-        "max_tokens": 4000,
-        "messages": [{"role": "user", "content": PROMPT.format(
-            profile=profile, items=json.dumps(items, ensure_ascii=False, indent=1))}],
-    }
+    return PROMPT.format(profile=profile, items=json.dumps(items, ensure_ascii=False, indent=1))
+
+
+def ask_api(prompt):
+    """Anthropic API, billed per token. Needs ANTHROPIC_API_KEY."""
     r = requests.post(
         "https://api.anthropic.com/v1/messages",
         headers={"x-api-key": os.environ["ANTHROPIC_API_KEY"],
                  "anthropic-version": "2023-06-01", "content-type": "application/json"},
-        json=body, timeout=120,
+        json={"model": os.environ.get("CLAUDE_MODEL", "claude-haiku-5-5"), "max_tokens": 4000,
+              "system": SYSTEM, "messages": [{"role": "user", "content": prompt}]},
+        timeout=120,
     )
     r.raise_for_status()
-    text = "".join(b.get("text", "") for b in r.json()["content"] if b.get("type") == "text")
+    return "".join(b.get("text", "") for b in r.json()["content"] if b.get("type") == "text")
+
+
+def find_claude():
+    for cand in (os.environ.get("CLAUDE_BIN"), shutil.which("claude"),
+                 str(Path.home() / ".local/bin/claude")):
+        if cand and Path(cand).exists():
+            return cand
+    raise RuntimeError("Claude Code CLI not found. Install it (curl -fsSL https://claude.ai/install.sh | bash), "
+                       "run `claude` once to log in, or set CLAUDE_BIN in .env.")
+
+
+def ask_claude_cli(prompt):
+    """Claude Code CLI in print mode, using whatever account `claude` is logged in with (your subscription).
+    One turn, all tools disabled, nothing saved to session history."""
+    cmd = [find_claude(), "-p",
+           "--model", os.environ.get("CLAUDE_MODEL", "haiku"),
+           "--output-format", "json",
+           "--system-prompt", SYSTEM,
+           "--tools", "",
+           "--disallowedTools", "mcp__*",
+           "--max-turns", "1",
+           "--no-session-persistence"]
+    env = dict(os.environ)
+    # If an API key is in the environment the CLI may bill it instead of the subscription; keep it out.
+    env.pop("ANTHROPIC_API_KEY", None)
+    r = subprocess.run(cmd, input=prompt, capture_output=True, text=True, env=env, cwd=HERE, timeout=300)
+    if r.returncode != 0:
+        raise RuntimeError(f"claude -p failed (exit {r.returncode}). If it says you're not logged in, "
+                           f"run `claude` once interactively.\n{r.stderr or r.stdout}")
+    out = json.loads(r.stdout)
+    if out.get("is_error"):
+        raise RuntimeError(f"claude -p returned an error: {out.get('result') or out}")
+    return out.get("result", "")
+
+
+def classify(items):
+    """items: list of dicts with id/kind/... ; returns list of verdict dicts."""
+    prompt = build_prompt(items)
+    backend = os.environ.get("LLM_BACKEND", "claude-cli").strip().lower()
+    text = ask_api(prompt) if backend == "api" else ask_claude_cli(prompt)
     start, end = text.find("["), text.rfind("]")
+    if start < 0 or end < start:
+        raise RuntimeError(f"Model did not return a JSON array:\n{text[:500]}")
     return json.loads(text[start:end + 1])
 
 
